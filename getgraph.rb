@@ -1,15 +1,17 @@
+require 'date'
+require 'json'
 require 'net/http'
 require 'neography'
-require 'json'
 
 # neo4j configuration
 Neography.configure do |config|
+	config.log_enabled = true
 end
 
 @neo = Neography::Rest.new
 
 work_queue = 
-	["0000000000000000b6359c198b89747d41ebd833fc118e0d920a44ad63af0578"]
+	["00000000000000006d5bc2f2504a85075b78f8f4c1515ced842629ade7c201b3"]
 
 def get_or_create_address_node(neo_tx, address)
 	# try and find existing node
@@ -28,27 +30,33 @@ def get_or_create_address_node(neo_tx, address)
 end
 
 def get_or_create_tx_node(neo_tx, tx)
-	# try and find existing node
-	results = @neo.in_transaction(neo_tx,
-		['match (n:Txn { hash: {hash} }) return id(n)', 
-			{:hash => tx[:hash]}])["results"][0]
+	# puts "get_or_create_tx_node(#{tx[:hash]})"
 
-	if (results["data"].length > 0) then
-		# node already exists
-		return results["data"][0][0]
-	else
+	# # try and find existing node
+	# results = @neo.in_transaction(neo_tx,
+	# 	['match (n:Txn { hash: {hash} }) return id(n)', 
+	# 		{:hash => tx[:hash]}])["results"][0]
+
+	# if (results["data"].length > 0) then
+	# 	# node already exists
+	# 	return results["data"][0][0]
+	# else
 		return @neo.in_transaction(neo_tx,
 			["create (n:Txn {props}) return id(n)",
 				{:props => tx}])
-	end
+	# end
 end
 
 while work_queue.length > 0 do
 	# get next block
 	block_id = work_queue.shift
+	print "working on block #{block_id}... "
+
 	block_json = 
 		Net::HTTP.get(URI("http://blockchain.info/rawblock/#{block_id}"))
 	block = JSON.parse(block_json)
+
+	puts "height #{block["height"]}"
 
 	# extract graph topology of block
 	addresses = []
@@ -57,7 +65,7 @@ while work_queue.length > 0 do
 	output_edges = []
 
 	block["tx"].each do |block_tx|
-		txns << { hash: block_tx["hash"] }
+		txns << { hash: block_tx["hash"], time: block_tx["time"] }
 
 		block_tx["inputs"].each do |input|
 			# 0-input txns have inputs: [{}], for some reason
@@ -90,6 +98,12 @@ while work_queue.length > 0 do
 		# puts "adding address node for " + addr.inspect
 		get_or_create_address_node(neo_tx, addr)
 	end
+
+	# HACK: since we reuse existing address nodes anyway, commit address nodes
+	# in a separate transaction
+	@neo.commit_transaction(neo_tx)
+
+	neo_tx = @neo.begin_transaction
 
 	txns.each do |tx|
 		# puts "adding txn node for " + tx.inspect
@@ -130,4 +144,11 @@ while work_queue.length > 0 do
 	@neo.commit_transaction(neo_tx)
 
 	# add newly-discovered blocks
+	# TODO: add some way of discovering blocks "down" the blockchain
+	if (block["prev_block"] != "") then
+		# temporary: if this block is more than a day old, stop
+		break if (DateTime.now - DateTime.strptime(block["time"].to_s, '%s') >= 86400)
+
+		work_queue << block["prev_block"]
+	end
 end
